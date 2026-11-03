@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8" />
+<title>Slither Multiplayer</title>
+<style>
+  body { margin:0; background:#0b0f14; color:#e6edf3; font-family:system-ui,sans-serif; overflow:hidden; }
+  canvas { display:block; }
+  .hud { position:fixed; top:10px; left:10px; font-size:16px; background:rgba(0,0,0,.4); padding:8px 12px; border-radius:8px; z-index:5; }
+  .hint { position:fixed; bottom:10px; left:10px; color:#8b949e; font-size:13px; z-index:5; }
+  #lb { position:fixed; top:10px; right:10px; background:rgba(0,0,0,.4); padding:8px 12px; border-radius:8px; font-size:13px; min-width:160px; z-index:5; }
+  #status { position:fixed; top:50px; left:10px; color:#f0883e; font-size:14px; z-index:5; }
+  #menu { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; background:#0b0f14; z-index:20; gap:16px; }
+  #menu h1 { margin:0; color:#3fb950; }
+  #menu input { padding:8px 12px; font-size:16px; border-radius:8px; border:1px solid #30363d; background:#161b22; color:#e6edf3; }
+  .menubtns { display:flex; gap:12px; }
+  #menu button { padding:10px 20px; font-size:16px; border:none; border-radius:8px; background:#238636; color:#fff; cursor:pointer; }
+  #menu button:hover { background:#2ea043; }
+</style>
+</head>
+<body>
+<div id="menu">
+  <div id="lastMass" style="color:#d29922;font-size:18px;margin-bottom:4px;">Последняя масса: 0</div>
+  <h1>Slither Multiplayer</h1>
+  <input id="nameInput" value="Игрок" maxlength="16" />
+  <div class="menubtns">
+    <button id="btnConnect">Подключиться</button>
+  </div>
+  <div id="connStatus" style="color:#8b949e;font-size:14px;"></div>
+</div>
+<canvas id="c"></canvas>
+<div class="hud">Длина: <span id="len">0</span></div>
+<div id="lb"></div>
+<div id="status"></div>
+<div class="hint">Мышь — направление. ЛКМ/Пробел — буст. R — (на сервере авто-респавн).</div>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+function resize(){ canvas.width=innerWidth; canvas.height=innerHeight; }
+resize(); addEventListener('resize', resize);
+
+const WORLD = 4000;
+let ws = null;
+let myId = null;
+let worldSize = WORLD;
+let state = null;
+let stateHistory = [];
+let boost = false;
+let mouse = {x: innerWidth/2, y: innerHeight/2};
+let camera = {x: WORLD/2, y: WORLD/2};
+let deathTriggered = false;
+let lastMass = 0;
+function returnToMenu(){
+  // save last mass
+  const me = state ? state.players.find(p=>p.id===myId) : null;
+  if (me) lastMass = me.segs.length;
+  const lm = document.getElementById('lastMass');
+  if (lm) lm.textContent = 'Последняя масса: ' + lastMass;
+  if (ws){ try { ws.close(); } catch(e){} ws=null; }
+  connected = false; state = null; stateHistory = [];
+  deathTriggered = false;
+  document.getElementById('menu').style.display = 'flex';
+  document.getElementById('connStatus').textContent = '';
+}
+
+function send(obj){ if (ws && ws.readyState===1) ws.send(JSON.stringify(obj)); }
+
+document.getElementById('btnConnect').addEventListener('click', ()=>{
+  const name = document.getElementById('nameInput').value.trim() || 'Игрок';
+  const status = document.getElementById('connStatus');
+  status.textContent = 'Подключение...';
+  const wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
+  ws = new WebSocket(wsUrl);
+  ws.onopen = ()=>{
+    send({type:'join', name});
+    status.textContent = 'Подключено';
+  };
+  ws.onmessage = (ev)=>{
+    const msg = JSON.parse(ev.data);
+    if (msg.type === 'welcome'){ myId = msg.id; worldSize = msg.world; connected = true; deathTriggered = false; document.getElementById('menu').style.display='none'; }
+    if (msg.type === 'state'){ 
+      state = msg; 
+      stateHistory.push({ players: msg.players, foods: msg.foods, time: performance.now() });
+      if (stateHistory.length > 3) stateHistory.shift();
+    }
+  };
+  ws.onclose = ()=>{ status.textContent = 'Отключено'; connected=false; document.getElementById('menu').style.display='flex'; };
+  ws.onerror = ()=>{ status.textContent = 'Ошибка подключения (сервер запущен?)'; };
+});
+
+addEventListener('mousemove', e=>{ mouse.x=e.clientX; mouse.y=e.clientY; });
+addEventListener('mousedown', e=>{ if(e.button===0){ boost=true; } });
+addEventListener('mouseup', e=>{ if(e.button===0){ boost=false; } });
+addEventListener('keydown', e=>{ if(e.code==='Space'){ boost=true; e.preventDefault(); } });
+addEventListener('keyup', e=>{ if(e.code==='Space'){ boost=false; } });
+
+function myPlayer(){ if(!state) return null; return state.players.find(p=>p.id===myId); }
+
+function sendInput(){
+  const me = myPlayer();
+  if (!me || !me.alive) return;
+  const angle = Math.atan2(mouse.y - innerHeight/2, mouse.x - innerWidth/2);
+  // need world-space angle: mouse relative to center corresponds to player direction; angle is screen-space, same as world since camera follows. OK.
+  send({type:'input', angle, boost});
+}
+
+setInterval(sendInput, 16);
+
+function drawSnake(s, isMe){
+  const segs = s.segs;
+  for (let i=segs.length-1;i>=0;i--){
+    const seg=segs[i];
+    const sx = seg.x - camera.x + innerWidth/2;
+    const sy = seg.y - camera.y + innerHeight/2;
+    const r = Math.max(3, 9 - i*0.03);
+    ctx.beginPath();
+    ctx.arc(sx,sy, i===0?11:r, 0, Math.PI*2);
+    ctx.fillStyle = s.color;
+    ctx.fill();
+    if (i===0){
+      ctx.fillStyle='#fff';
+      ctx.beginPath(); ctx.arc(sx+Math.cos(s.dir||0)*4, sy+Math.sin(s.dir||0)*4 -3, 3,0,Math.PI*2); ctx.fill();
+      ctx.beginPath(); ctx.arc(sx+Math.cos(s.dir||0)*4, sy+Math.sin(s.dir||0)*4 +3, 3,0,Math.PI*2); ctx.fill();
+    }
+  }
+  const hx = segs[0].x - camera.x + innerWidth/2;
+  const hy = segs[0].y - camera.y + innerHeight/2;
+  ctx.fillStyle='#fff';
+  ctx.font='bold 12px system-ui';
+  ctx.textAlign='center';
+  ctx.fillText(s.name, hx, hy-16);
+}
+
+function getInterpolatedPlayers(){
+  if (!state) return [];
+  if (stateHistory.length < 2) return state.players;
+  const prev = stateHistory[stateHistory.length-2];
+  const curr = stateHistory[stateHistory.length-1];
+  const dt = curr.time - prev.time;
+  let a = dt > 0 ? (performance.now() - prev.time) / dt : 1;
+  a = Math.max(0, Math.min(1.0, a));
+  const result = [];
+  for (const cp of curr.players){
+    const pp = prev.players.find(p=>p.id===cp.id);
+    if (!pp || !pp.alive || !cp.alive){ result.push(cp); continue; }
+    const segs = [];
+    const n = Math.min(pp.segs.length, cp.segs.length);
+    for (let i=0;i<n;i++){
+      segs.push({ x: pp.segs[i].x + (cp.segs[i].x-pp.segs[i].x)*a, y: pp.segs[i].y + (cp.segs[i].y-pp.segs[i].y)*a });
+    }
+    for (let i=n;i<cp.segs.length;i++) segs.push(cp.segs[i]);
+    result.push(Object.assign({}, cp, { segs }));
+  }
+  return result;
+}
+
+function draw(){
+  if (!state) return;
+  const interpPlayers = getInterpolatedPlayers();
+  const me = interpPlayers.find(p=>p.id===myId) || myPlayer();
+  if (me && me.alive) {
+    camera.x += (me.segs[0].x - camera.x)*0.4;
+    camera.y += (me.segs[0].y - camera.y)*0.4;
+  }
+  if (me && !me.alive && !deathTriggered) {
+    deathTriggered = true;
+    setTimeout(returnToMenu, 2000);
+  }
+  ctx.fillStyle = '#0d1117';
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+  // grid
+  ctx.strokeStyle = '#161b22';
+  const g=100;
+  const startX = Math.floor((camera.x - innerWidth/2)/g)*g;
+  const startY = Math.floor((camera.y - innerHeight/2)/g)*g;
+  for (let x=startX; x < camera.x+innerWidth/2+g; x+=g){
+    const sx = x - camera.x + innerWidth/2;
+    ctx.beginPath(); ctx.moveTo(sx,0); ctx.lineTo(sx,canvas.height); ctx.stroke();
+  }
+  for (let y=startY; y < camera.y+innerHeight/2+g; y+=g){
+    const sy = y - camera.y + innerHeight/2;
+    ctx.beginPath(); ctx.moveTo(0,sy); ctx.lineTo(canvas.width,sy); ctx.stroke();
+  }
+  // border
+  ctx.strokeStyle = '#f85149';
+  ctx.lineWidth=4;
+  ctx.strokeRect(-camera.x+innerWidth/2, -camera.y+innerHeight/2, worldSize, worldSize);
+  ctx.lineWidth=1;
+
+  // foods
+  for (const f of state.foods){
+    const sx = f.x - camera.x + innerWidth/2;
+    const sy = f.y - camera.y + innerHeight/2;
+    if (sx<-20||sx>innerWidth+20||sy<-20||sy>innerHeight+20) continue;
+    ctx.beginPath();
+    ctx.arc(sx,sy,f.r,0,Math.PI*2);
+    ctx.fillStyle = f.color;
+    ctx.fill();
+  }
+
+  // snakes
+  for (const p of interpPlayers){
+    if (p.id===myId) continue;
+    if (!p.alive) continue;
+    drawSnake(p, false);
+  }
+  if (me && me.alive) drawSnake(me, true);
+
+  // HUD
+  if (me) document.getElementById('len').textContent = me.segs.length;
+  // leaderboard
+  const sorted = state.players.filter(p=>p.alive).map(p=>({name:p.name,len:p.segs.length})).sort((a,b)=>b.len-a.len).slice(0,6);
+  document.getElementById('lb').innerHTML = '<b>Онлайн</b><br>'+sorted.map((s,i)=>`${i+1}. ${s.name} — ${s.len}`).join('<br>');
+  // status
+  const aliveCount = state.players.filter(p=>p.alive).length;
+  document.getElementById('status').textContent = `Игроков: ${state.players.length} (живых ${aliveCount})`;
+  if (me && !me.alive) {
+    ctx.fillStyle='rgba(0,0,0,0.6)';
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+    ctx.fillStyle='#f85149';
+    ctx.font='bold 40px system-ui';
+    ctx.textAlign='center';
+    ctx.fillText('Вы погибли', canvas.width/2, canvas.height/2);
+    ctx.font='18px system-ui';
+    ctx.fillStyle='#e6edf3';
+    ctx.fillText('Возврат в меню...', canvas.width/2, canvas.height/2+40);
+  }
+  drawMinimap(interpPlayers);
+}
+
+function drawMinimap(players){
+  const size = 160;
+  const pad = 10;
+  const mx = pad;
+  const my = canvas.height - size - pad;
+  const scale = size / worldSize;
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  ctx.fillRect(mx, my, size, size);
+  ctx.strokeStyle = '#30363d';
+  ctx.strokeRect(mx, my, size, size);
+  if (!players) players = state ? state.players : [];
+  if (!players) return;
+  for (const p of players){
+    if (!p.alive) continue;
+    const hx = mx + p.segs[0].x*scale;
+    const hy = my + p.segs[0].y*scale;
+    ctx.beginPath();
+    ctx.arc(hx, hy, p.id===myId?4:2.5, 0, Math.PI*2);
+    ctx.fillStyle = p.color;
+    ctx.fill();
+    if (p.id===myId){ ctx.strokeStyle='#fff'; ctx.lineWidth=1; ctx.stroke(); }
+  }
+}
+
+function loop(){ draw(); requestAnimationFrame(loop); }
+loop();
+</script>
+</body>
+</html>
